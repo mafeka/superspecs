@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "description": "SuperSpec: a spec-driven development workflow wrapping the openspec CLI with TDD discipline and subagent-based implementation.",
   "type": "module",
+  "scripts": {
+    "test": "node --test \"test/**/*.test.mjs\""
+  },
   "bin": {
     "superspecs": "bin/install.js"
   },
