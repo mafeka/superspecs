@@ -1,7 +1,7 @@
 # SuperSpec
 
 A spec-driven development workflow that wraps the [OpenSpec](https://github.com/Fission-AI/OpenSpec)
-CLI with TDD discipline and subagent-based implementation, for Claude Code.
+CLI with TDD discipline and subagent-based implementation, for Claude Code and OpenCode.
 
 The core idea: **a Given/When/Then scenario and a test case are the same object.**
 Requirements are terse (one SHALL sentence, 1-3 scenarios) and every scenario
@@ -29,11 +29,14 @@ Or with `npx`:
 npx github:mafeka/superspecs
 ```
 
-Both accept a target directory and `--force` (overwrite files already installed):
+Both accept a target directory, `--force` (overwrite files already installed), and
+`--host <claude|opencode|all>` (default `all`) to restrict which host's command
+set gets installed:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/mafeka/superspecs/main/install.sh | bash -s -- /path/to/repo --force
 npx github:mafeka/superspecs /path/to/repo --force
+npx github:mafeka/superspecs /path/to/repo --host opencode
 ```
 
 **Requirements in the target repo:** `git`, `node` (>= 18), and either the
@@ -42,14 +45,17 @@ devDependency. The target should be (or become) a git repository —
 `/superspec-apply`'s task and final reviews both work from `git diff`.
 
 The installer is idempotent: re-running it skips files that already exist
-unless `--force` is passed. It will:
+unless `--force` is passed. By default it installs the command set for both
+hosts; pass `--host claude` or `--host opencode` to install just one. It will:
 
 - Add `openspec/schemas/superspec/` — the forked OpenSpec schema enforcing
   the terse requirement format
 - Add `scripts/superspec-lint.mjs` — the semantic lint (scenario coverage,
   task-size cap, one-sentence requirements)
-- Add `.claude/commands/superspec-*.md` — the five slash commands below
-- Add `.claude/superspec/` — subagent dispatch prompt templates used by `/superspec-apply`
+- Add `.claude/commands/superspec-*.md` — the five slash commands below (Claude Code; skipped with `--host opencode`)
+- Add `.claude/superspec/` — subagent dispatch prompt templates used by `/superspec-apply` (Claude Code; skipped with `--host opencode`)
+- Add `.opencode/command/superspec-*.md` — the five commands below (OpenCode; skipped with `--host claude`)
+- Add `.opencode/agent/superspec.md` and `.opencode/superspec/` — the OpenCode agent and its dispatch prompt templates (OpenCode; skipped with `--host claude`)
 - Run `openspec init` if the target has no `openspec/` root yet
 - Set `openspec/config.yaml`'s default schema to `superspec`
 

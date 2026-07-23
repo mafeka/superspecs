@@ -18,7 +18,14 @@
     ".claude/commands/superspec-tasks.md",
     ".claude/commands/superspec-apply.md",
     ".claude/commands/superspec-archive.md",
-    ".claude/superspec"
+    ".claude/superspec",
+    ".opencode/command/superspec-explore.md",
+    ".opencode/command/superspec-propose.md",
+    ".opencode/command/superspec-tasks.md",
+    ".opencode/command/superspec-apply.md",
+    ".opencode/command/superspec-archive.md",
+    ".opencode/agent/superspec.md",
+    ".opencode/superspec"
   ],
   "engines": {
     "node": ">=18"
