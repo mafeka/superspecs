@@ -1,0 +1,27 @@
+{
+  "name": "superspecs",
+  "version": "0.1.0",
+  "description": "SuperSpec: a spec-driven development workflow wrapping the openspec CLI with TDD discipline and subagent-based implementation.",
+  "type": "module",
+  "bin": {
+    "superspecs": "bin/install.js"
+  },
+  "files": [
+    "bin",
+    "openspec/schemas/superspec",
+    "scripts/superspec-lint.mjs",
+    ".claude/commands/superspec-explore.md",
+    ".claude/commands/superspec-propose.md",
+    ".claude/commands/superspec-tasks.md",
+    ".claude/commands/superspec-apply.md",
+    ".claude/commands/superspec-archive.md",
+    ".claude/superspec"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mafeka/superspecs.git"
+  }
+}

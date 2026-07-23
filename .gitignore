@@ -1,0 +1,6 @@
+.DS_Store
+node_modules/
+_assets/
+.claude/settings.local.json
+openspec/changes/*
+!openspec/changes/archive
