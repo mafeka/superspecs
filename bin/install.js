@@ -15,9 +15,12 @@ import { execFileSync, spawnSync } from 'node:child_process';
 
 const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 
-const PAYLOAD_PATHS = [
+const SHARED_PAYLOAD_PATHS = [
   'openspec/schemas/superspec',
   'scripts/superspec-lint.mjs',
+];
+
+const CLAUDE_PAYLOAD_PATHS = [
   '.claude/commands/superspec-explore.md',
   '.claude/commands/superspec-propose.md',
   '.claude/commands/superspec-tasks.md',
@@ -25,6 +28,18 @@ const PAYLOAD_PATHS = [
   '.claude/commands/superspec-archive.md',
   '.claude/superspec',
 ];
+
+const OPENCODE_PAYLOAD_PATHS = [
+  '.opencode/command/superspec-explore.md',
+  '.opencode/command/superspec-propose.md',
+  '.opencode/command/superspec-tasks.md',
+  '.opencode/command/superspec-apply.md',
+  '.opencode/command/superspec-archive.md',
+  '.opencode/agent/superspec.md',
+  '.opencode/superspec',
+];
+
+const VALID_HOSTS = ['claude', 'opencode', 'all'];
 
 function log(message) {
   console.log(`[superspecs] ${message}`);
@@ -46,9 +61,20 @@ function run(cmd, args, cwd) {
 
 function parseArgs(argv) {
   const force = argv.includes('--force');
-  const positional = argv.filter((a) => !a.startsWith('--'));
+
+  const hostFlagIndex = argv.indexOf('--host');
+  const host = hostFlagIndex === -1 ? 'all' : argv[hostFlagIndex + 1];
+  if (!VALID_HOSTS.includes(host)) {
+    fail(`Invalid --host value: ${host}. Expected one of: ${VALID_HOSTS.join(', ')}`);
+  }
+
+  const positional = argv.filter((a, i) => {
+    if (a.startsWith('--')) return false;
+    if (i === hostFlagIndex + 1 && hostFlagIndex !== -1) return false; // the --host value itself
+    return true;
+  });
   const target = positional[0] ? resolve(positional[0]) : process.cwd();
-  return { target, force };
+  return { target, force, host };
 }
 
 function ensureGit(target) {
@@ -85,17 +111,28 @@ function resolveOpenspecBin(target) {
   );
 }
 
-function ensureOpenspecRoot(openspecBin, target) {
+function toolsForHost(host) {
+  if (host === 'claude') return 'claude';
+  if (host === 'opencode') return 'opencode';
+  return 'claude,opencode';
+}
+
+function ensureOpenspecRoot(openspecBin, target, host) {
   if (existsSync(join(target, 'openspec'))) {
     log('openspec/ already exists — skipping `openspec init`.');
     return;
   }
-  log('Running `openspec init --tools claude`...');
-  run(openspecBin, ['init', '.', '--tools', 'claude'], target);
+  const tools = toolsForHost(host);
+  log(`Running \`openspec init --tools ${tools}\`...`);
+  run(openspecBin, ['init', '.', '--tools', tools], target);
 }
 
-function installPayload(target, force) {
-  for (const rel of PAYLOAD_PATHS) {
+function installPayload(target, force, host) {
+  const paths = [...SHARED_PAYLOAD_PATHS];
+  if (host === 'claude' || host === 'all') paths.push(...CLAUDE_PAYLOAD_PATHS);
+  if (host === 'opencode' || host === 'all') paths.push(...OPENCODE_PAYLOAD_PATHS);
+
+  for (const rel of paths) {
     const src = join(PACKAGE_ROOT, rel);
     const dest = join(target, rel);
 
@@ -139,18 +176,18 @@ function validateSchema(openspecBin, target) {
 }
 
 function main() {
-  const { target, force } = parseArgs(process.argv.slice(2));
+  const { target, force, host } = parseArgs(process.argv.slice(2));
 
   if (!existsSync(target)) {
     fail(`Target directory does not exist: ${target}`);
   }
 
-  log(`Installing into ${target}${force ? ' (--force: overwriting existing files)' : ''}`);
+  log(`Installing into ${target}${force ? ' (--force: overwriting existing files)' : ''} [host: ${host}]`);
 
   ensureGit(target);
   const openspecBin = resolveOpenspecBin(target);
-  ensureOpenspecRoot(openspecBin, target);
-  installPayload(target, force);
+  ensureOpenspecRoot(openspecBin, target, host);
+  installPayload(target, force, host);
   setDefaultSchema(target);
   validateSchema(openspecBin, target);
 
