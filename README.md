@@ -8,6 +8,13 @@ Requirements are terse (one SHALL sentence, 1-3 scenarios) and every scenario
 maps to exactly one named test, enforced by a semantic lint script that runs
 alongside `openspec validate --strict`.
 
+> **This is alpha software.** It dispatches an unbounded number of subagents
+> in a loop and will happily burn through a large number of tokens doing so.
+> It has not been proven not to set your house on fire. Use it on a system
+> you're prepared to lose, review what it's about to do before you approve
+> it, and please, for everyone's sake, do not let it anywhere near your
+> neighbor's spouse. You have been warned.
+
 ## Install
 
 Into an existing repository (installs into the current directory by default):
