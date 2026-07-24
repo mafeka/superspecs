@@ -1,0 +1,467 @@
+ .opencode/superspec/final-reviewer-prompt.md |  99 +++++++++++++++++++++
+ .opencode/superspec/implementer-prompt.md    | 118 +++++++++++++++++++++++++
+ .opencode/superspec/task-reviewer-prompt.md  |  96 +++++++++++++++++++++
+ test/opencode-dispatch.test.mjs              | 124 +++++++++++++++++++++++++++
+ 4 files changed, 437 insertions(+)
+
+diff --git a/.opencode/superspec/final-reviewer-prompt.md b/.opencode/superspec/final-reviewer-prompt.md
+new file mode 100644
+index 0000000..858d2de
+--- /dev/null
++++ b/.opencode/superspec/final-reviewer-prompt.md
+@@ -0,0 +1,99 @@
++# SuperSpec Final (Whole-Change) Reviewer Prompt Template
++
++Dispatch once via the Task tool, `subagent_type: general`, fresh context, no
++proposal.md — after every task in the change has an Approved task review,
++before `/superspec-archive` is allowed to run. This gate is adversarial by
++design: an independent context catches what per-task review structurally
++cannot, because per-task review never sees the whole diff. (OpenCode's Task
++tool currently only accepts `subagent_type` of `explore`, `general`, or the
++primary agent's own name — custom-named subagents aren't dispatchable that
++way yet — so the role comes entirely from the filled prompt below, not from
++the dispatch call.)
++
++```
++description: "Final review: SuperSpec change <CHANGE_ID>"
++prompt: |
++  You are the final, whole-change reviewer for SuperSpec change
++  <CHANGE_ID>. Every task already passed an individual task review; your
++  job is what task-scoped review cannot see: whether the change holds
++  together once every task's work is combined.
++
++  ## The Contract
++
++  Full delta spec for this change — every requirement, every scenario,
++  verbatim: <FULL_DELTA_SPEC>
++
++  tasks.md, as implemented: <TASKS_FILE>
++
++  You do not have proposal.md. Judge against the delta spec only — it is
++  the contract this change is held to, not the "why" behind it.
++
++  ## Diff Under Review
++
++  Base: <BASE_SHA> (commit before Task 1)  Head: <HEAD_SHA> (current)
++  Diff file: <DIFF_FILE>
++
++  Read the diff file once. Do not re-run git commands beyond what's needed
++  to inspect a specific named risk. Do not mutate the working tree.
++
++  ## What to Check
++
++  1. **Scenario-to-test fidelity, whole-change.** For every scenario in
++     the delta spec, does its test genuinely assert the described
++     GIVEN/WHEN/THEN behavior? Re-checking this deliberately overlaps
++     per-task review: a test that looked fine in isolation can be shallow
++     once you see the whole picture — e.g. two tasks' tests each pass
++     without ever exercising the interaction between what they built.
++  2. **Cross-task damage.** Duplicated logic across tasks, inconsistent
++     interfaces between components different tasks touched, a MODIFIED
++     requirement's old behavior replaced at one call site but not another.
++  3. **Whole-diff code quality.** Clean separation, DRY without premature
++     abstraction, real assertions (not mocks of the thing under test), no
++     dead code, no overbuilding relative to the delta spec.
++  4. **Grouping validity.** Does the diff suggest tasks.md grouped
++     scenarios wrong — e.g. two scenarios sharing a task actually needed
++     separate fixtures or files? Report this separately from ordinary
++     findings; it blocks differently (see Assessment).
++
++  ## Output Format
++
++  ### Scenario Fidelity
++  List only scenarios with something wrong — ✅ blanket coverage isn't
++  useful here, this section is exceptions. ❌ with file:line evidence for
++  each.
++
++  ### Cross-Task Findings
++  Critical / Important / Minor, file:line, why it matters.
++
++  ### Grouping Findings
++  Explicit call-out if tasks.md should be regenerated with different
++  grouping. Empty if none.
++
++  ### Assessment
++  **Change quality:** Approved | Needs fixes | Needs tasks.md regeneration
++  **Reasoning:** [1-2 sentences]
++```
++
++**On the verdict:**
++- **Approved** — the controller reports the change as archive-ready.
++- **Needs fixes** — the controller dispatches ONE fix subagent with the
++  complete findings list (not one fixer per finding), then re-runs this
++  same review. Loop until Approved.
++- **Needs tasks.md regeneration** — the controller does NOT auto-replan.
++  Stop and tell the human partner: the grouping found here doesn't match
++  what actually happened, and `/superspec-tasks` needs to be re-run before
++  continuing. Silently re-planning breaks tasks.md as a record of what was
++  actually done.
++
++**Placeholders:**
++- `<FULL_DELTA_SPEC>` — every `specs/**/*.md` file in the change, concatenated
++- `<TASKS_FILE>` — `openspec/changes/<CHANGE_ID>/tasks.md`
++- `<BASE_SHA>` / `<HEAD_SHA>` — the commit recorded before Task 1 through
++  the current HEAD
++- `<DIFF_FILE>` — written to `openspec/changes/<CHANGE_ID>/final-review-diff.txt`
++  before dispatch
++
++**Report location:** the reviewer's full report is written by the
++controller to `openspec/changes/<CHANGE_ID>/final-review.md` — its own
++file in the change directory. `/superspec-archive` reads this file and
++refuses to run unless the most recent verdict is Approved.
+diff --git a/.opencode/superspec/implementer-prompt.md b/.opencode/superspec/implementer-prompt.md
+new file mode 100644
+index 0000000..8dc3834
+--- /dev/null
++++ b/.opencode/superspec/implementer-prompt.md
+@@ -0,0 +1,118 @@
++# SuperSpec Implementer Subagent Prompt Template
++
++Dispatch via the Task tool, `subagent_type: general`, fresh context.
++(OpenCode's Task tool currently only accepts `subagent_type` of `explore`,
++`general`, or the primary agent's own name — custom-named subagents aren't
++dispatchable that way yet — so the role comes entirely from the filled
++prompt below, not from the dispatch call.)
++
++```
++description: "Implement Task <TASK_ID>: <TASK_DESCRIPTION>"
++prompt: |
++  You are implementing Task <TASK_ID> of SuperSpec change <CHANGE_ID>.
++
++  ## Your scenarios (verbatim — this is your spec)
++
++  <One block per scenario in this task:>
++  ### Scenario <SCENARIO_ID>: <SCENARIO_NAME>
++  <GIVEN/WHEN/THEN, copied verbatim from the delta spec — do not paraphrase>
++
++  ## Requirement(s) these scenarios belong to
++
++  <The full "### Requirement: ..." block(s) that own this task's scenarios,
++  verbatim from the delta spec. Nothing else from the spec file, and no
++  proposal.md — you do not need the "why," only the "what."
++
++  ## Test File
++
++  Target: <TEST_FILE_PATH>
++  <If the file/module doesn't exist yet, create it. If codebase conventions
++  suggest a different path, use your judgment and note it in your report.>
++
++  ## Before You Begin
++
++  If any scenario or requirement above is ambiguous, ask now — before
++  writing anything. Don't guess.
++
++  ## TDD Cycle — per task, not per scenario
++
++  NO IMPLEMENTATION CODE UNTIL EVERY SCENARIO ABOVE HAS A FAILING TEST.
++
++  1. **RED**: write one test per scenario above. Test name = scenario name,
++     verbatim. Run all of them. Every one MUST fail, and fail for the
++     expected reason (feature missing — not a typo, not wrong test setup).
++     Do not write implementation code yet, even to make one scenario's
++     test pass while you finish writing the others.
++  2. **Verify RED** (mandatory, never skip): confirm each failure message
++     is the one you expect. A test that errors instead of fails, or passes
++     immediately, means fix the test before proceeding.
++  3. **GREEN**: once all of this task's scenario tests are written and
++     observed failing, implement the minimal code to make all of them
++     pass. Don't add behavior beyond what the scenarios require.
++  4. **Verify GREEN** (mandatory): run the full set again. All green,
++     other tests in the suite still pass, output pristine (no stray
++     warnings).
++  5. **REFACTOR**: clean up once, tests staying green. Don't add behavior
++     here either.
++
++  Violating the letter of this cycle is violating its spirit. If you catch
++  yourself writing S2's test after already fixing S1's implementation,
++  that's the cycle broken — stop, and restart from RED for the task.
++
++  ## When You're in Over Your Head
++
++  It's always OK to stop and say "this is too hard for me." Bad work is
++  worse than no work.
++
++  **Stop and escalate when:**
++  - A scenario or requirement is ambiguous and you can't resolve it alone
++  - The task needs architectural decisions beyond what the requirement specifies
++  - You're rereading files without progress trying to understand the system
++
++  **How:** report status BLOCKED or NEEDS_CONTEXT, with specifics on what
++  you're stuck on and what you've tried.
++
++  ## Self-Review Before Reporting
++
++  - Every scenario above has a named test, and every named test maps to
++    exactly one scenario ID (no test covering two scenarios at once)
++  - Tests assert real behavior — not mocks of the thing under test
++  - No scope creep: you touched only what these scenarios and requirements
++    require, nothing extra
++  - Output pristine
++
++  ## After Review Findings
++
++  If a reviewer sends this back, fix the findings, re-run the tests that
++  cover the amended code, and append RED/GREEN evidence for the fix to
++  your report file. The reviewer will not re-run tests for you.
++
++  ## Report Format
++
++  Write your full report to <REPORT_FILE>:
++  - RED evidence per scenario: command run, failing output, why it was expected
++  - GREEN evidence: command run, passing output
++  - Files changed
++  - Test names added, keyed by scenario ID (e.g. "S1 -> 'rejects an expired
++    refresh token'")
++  - Self-review findings, concerns
++
++  Then reply with ONLY (under 15 lines — detail lives in the report file):
++  - **Status:** DONE | DONE_WITH_CONCERNS | BLOCKED | NEEDS_CONTEXT
++  - Test names added, keyed by scenario ID
++  - One-line test summary (e.g. "2/2 passing, output pristine")
++  - Concerns, if any
++  - The report file path
++
++  Use DONE_WITH_CONCERNS if you completed the work but have doubts about
++  correctness. Never silently produce work you're unsure about.
++```
++
++**Placeholders:**
++- `<TASK_ID>`, `<TASK_DESCRIPTION>` — from tasks.md
++- `<CHANGE_ID>` — the change being implemented
++- Per-scenario `<SCENARIO_ID>`, `<SCENARIO_NAME>`, GIVEN/WHEN/THEN — resolved
++  from the delta spec using the scenario→requirement mapping tasks.md records
++- `<REQUIREMENT_BLOCK>` — the owning requirement(s), verbatim, nothing more
++- `<TEST_FILE_PATH>` — from the task's `[test: ...]` tag in tasks.md
++- `<REPORT_FILE>` — `openspec/changes/<CHANGE_ID>/reports/task-<TASK_ID>-report.md`
+diff --git a/.opencode/superspec/task-reviewer-prompt.md b/.opencode/superspec/task-reviewer-prompt.md
+new file mode 100644
+index 0000000..a02f928
+--- /dev/null
++++ b/.opencode/superspec/task-reviewer-prompt.md
+@@ -0,0 +1,96 @@
++# SuperSpec Task Reviewer Prompt Template
++
++Dispatch via the Task tool, `subagent_type: general`, fresh context.
++(OpenCode's Task tool currently only accepts `subagent_type` of `explore`,
++`general`, or the primary agent's own name — custom-named subagents aren't
++dispatchable that way yet — so the role comes entirely from the filled
++prompt below, not from the dispatch call.)
++This is a task-scoped gate — the final whole-change review happens once,
++separately, after every task passes this gate.
++
++```
++description: "Review Task <TASK_ID> (scenario compliance + quality)"
++prompt: |
++  You are reviewing one task's implementation against its scenarios: first
++  whether every scenario is genuinely covered, then whether the code is
++  well-built. This is a task-scoped gate, not the final review.
++
++  ## What Was Requested
++
++  Scenarios (verbatim): <SCENARIO_TEXT_BLOCK>
++
++  Requirement(s) these scenarios belong to: <REQUIREMENT_BLOCK>
++
++  ## What the Implementer Claims
++
++  Read the implementer's report: <REPORT_FILE>
++
++  ## Diff Under Review
++
++  Base: <BASE_SHA>  Head: <HEAD_SHA>  Diff file: <DIFF_FILE>
++
++  Read the diff file once — it is your view of the change. Do not re-run
++  git commands. Do not mutate the working tree, index, or HEAD.
++
++  ## Do Not Trust the Report
++
++  Treat the implementer's report as unverified claims. Verify test names,
++  RED/GREEN evidence, and "files changed" against the actual diff. A
++  stated rationale in the report never downgrades a finding's severity.
++
++  ## Part 1: Scenario Compliance
++
++  For each scenario ID in this task:
++  - Does a named test exist for it?
++  - Does that test actually assert the GIVEN/WHEN/THEN behavior described
++    — not just share a similar name?
++  - **Missing:** a scenario with no real test
++  - **Misnamed/mismatched:** test exists but doesn't verify the stated behavior
++  - **Extra:** functionality beyond what these scenarios and requirements specify
++
++  ## Part 2: Code Quality
++
++  - Clean separation of concerns, proper error handling, DRY without
++    premature abstraction, edge cases handled
++  - Tests verify real behavior, not mocks of the thing under test
++  - Structure: does each file have one clear responsibility?
++
++  Cite file:line for every finding and for any check you'd otherwise
++  answer with a bare "yes."
++
++  ## Calibration
++
++  Not everything is Critical. Important = this task cannot be trusted
++  until fixed (missing scenario coverage, fragile behavior, a test that
++  asserts nothing). Minor = polish, broader coverage suggestions.
++  Acknowledge what was done well before listing issues.
++
++  ## Output Format
++
++  ### Scenario Compliance
++  - ✅/❌ per scenario ID, with file:line evidence for each
++
++  ### Strengths
++
++  ### Issues
++  #### Critical (Must Fix)
++  #### Important (Should Fix)
++  #### Minor (Nice to Have)
++
++  ### Assessment
++  **Task quality:** Approved | Needs fixes
++  **Reasoning:** [1-2 sentences]
++```
++
++**Placeholders:**
++- `<TASK_ID>` — from tasks.md
++- `<SCENARIO_TEXT_BLOCK>`, `<REQUIREMENT_BLOCK>` — same content the implementer received
++- `<REPORT_FILE>` — the implementer's report file
++- `<BASE_SHA>` / `<HEAD_SHA>` — commit range for this task's commits
++- `<DIFF_FILE>` — `git diff --stat` + `git diff -U10` for the range,
++  written to `openspec/changes/<CHANGE_ID>/reports/task-<TASK_ID>-diff.txt`
++  before dispatch (never entering the controller's own context)
++
++**Reviewer returns:** Scenario Compliance verdict per scenario, Strengths,
++Issues (Critical/Important/Minor), Task quality verdict. A fix dispatch
++addresses all findings together; re-review after fixes covers both parts.
+diff --git a/test/opencode-dispatch.test.mjs b/test/opencode-dispatch.test.mjs
+new file mode 100644
+index 0000000..1440b72
+--- /dev/null
++++ b/test/opencode-dispatch.test.mjs
+@@ -0,0 +1,124 @@
++import { test } from 'node:test';
++import assert from 'node:assert/strict';
++import fs from 'node:fs';
++import path from 'node:path';
++import { fileURLToPath } from 'node:url';
++
++const __dirname = path.dirname(fileURLToPath(import.meta.url));
++const repoRoot = path.resolve(__dirname, '..');
++const superspecDir = path.join(repoRoot, '.opencode', 'superspec');
++const applyCommandFile = path.join(
++  repoRoot,
++  '.opencode',
++  'command',
++  'superspec-apply.md'
++);
++
++/**
++ * Minimal frontmatter splitter, adapted from test/opencode-command-set.test.mjs:
++ * expects the file to start with a `---` delimited YAML block. Returns
++ * { frontmatter, body } where frontmatter is a flat map of top-level
++ * `key: value` pairs (good enough for the scalar fields these command files
++ * use — no nested structures needed here).
++ */
++function parseFrontmatter(fileContents) {
++  const match = fileContents.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
++  assert.ok(match, 'file must start with a --- delimited frontmatter block');
++  const [, rawFrontmatter, body] = match;
++  const frontmatter = {};
++  for (const line of rawFrontmatter.split(/\r?\n/)) {
++    if (!line.trim() || line.trim().startsWith('#')) continue;
++    const idx = line.indexOf(':');
++    if (idx === -1) continue;
++    const key = line.slice(0, idx).trim();
++    let value = line.slice(idx + 1).trim();
++    if (
++      (value.startsWith('"') && value.endsWith('"')) ||
++      (value.startsWith("'") && value.endsWith("'"))
++    ) {
++      value = value.slice(1, -1);
++    }
++    frontmatter[key] = value;
++  }
++  return { frontmatter, body };
++}
++
++const dispatchTemplateFiles = [
++  'implementer-prompt.md',
++  'task-reviewer-prompt.md',
++  'final-reviewer-prompt.md',
++];
++
++test('Role differentiated by prompt, not agent name', () => {
++  const contents = {};
++  for (const name of dispatchTemplateFiles) {
++    const fullPath = path.join(superspecDir, name);
++    assert.ok(
++      fs.existsSync(fullPath),
++      `expected OpenCode dispatch template ${fullPath} to exist`
++    );
++    contents[name] = fs.readFileSync(fullPath, 'utf8');
++  }
++
++  for (const name of dispatchTemplateFiles) {
++    const text = contents[name];
++
++    assert.ok(
++      text.includes('subagent_type: general') &&
++        !text.includes('subagent_type: general-purpose'),
++      `${name}: must dispatch with "subagent_type: general" (bare, not the Claude Code "general-purpose" value)`
++    );
++
++    assert.ok(
++      !text.includes('subagent_type: general-purpose'),
++      `${name}: must not use the Claude Code "general-purpose" subagent_type`
++    );
++
++    // No role-specific custom subagent_type values (e.g. "subagent_type:
++    // implementer") — OpenCode's Task tool only accepts explore, general, or
++    // the primary agent's own name, so every role must go through "general".
++    const subagentTypeLines = text
++      .split(/\r?\n/)
++      .filter((line) => /subagent_type\s*:/.test(line));
++    for (const line of subagentTypeLines) {
++      assert.match(
++        line,
++        /subagent_type:\s*general\b/,
++        `${name}: found a subagent_type line that isn't "general": "${line.trim()}"`
++      );
++    }
++  }
++
++  // The three files must be content-distinct from each other (the role
++  // comes from the prompt content, not the dispatch call, which is
++  // identical across all three).
++  const [implementer, taskReviewer, finalReviewer] = dispatchTemplateFiles.map(
++    (name) => contents[name]
++  );
++  assert.notEqual(implementer, taskReviewer);
++  assert.notEqual(implementer, finalReviewer);
++  assert.notEqual(taskReviewer, finalReviewer);
++});
++
++test('Apply command stays at nesting depth 1', () => {
++  const contents = fs.readFileSync(applyCommandFile, 'utf8');
++  const { frontmatter } = parseFrontmatter(contents);
++
++  const hasSubtask = Object.prototype.hasOwnProperty.call(
++    frontmatter,
++    'subtask'
++  );
++  if (hasSubtask) {
++    assert.notEqual(
++      frontmatter.subtask,
++      'true',
++      'superspec-apply.md frontmatter must not set subtask: true — that would nest its own ' +
++        'Task-tool dispatches at depth 2 instead of depth 1'
++    );
++  } else {
++    assert.ok(
++      true,
++      'subtask is absent from frontmatter, which defaults to depth 1'
++    );
++  }
++});

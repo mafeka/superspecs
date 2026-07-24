@@ -1,0 +1,1448 @@
+ .opencode/agent/superspec.md                 |  32 ++++++
+ .opencode/command/superspec-apply.md         | 140 +++++++++++++++++++++++++++
+ .opencode/command/superspec-archive.md       |  45 +++++++++
+ .opencode/command/superspec-explore.md       |  62 ++++++++++++
+ .opencode/command/superspec-propose.md       |  79 +++++++++++++++
+ .opencode/command/superspec-tasks.md         | 112 +++++++++++++++++++++
+ .opencode/superspec/final-reviewer-prompt.md |  99 +++++++++++++++++++
+ .opencode/superspec/implementer-prompt.md    | 118 ++++++++++++++++++++++
+ .opencode/superspec/task-reviewer-prompt.md  |  96 ++++++++++++++++++
+ README.md                                    |  16 ++-
+ bin/install.js                               |  61 +++++++++---
+ package.json                                 |  12 ++-
+ test/installer-host.test.mjs                 |  86 ++++++++++++++++
+ test/opencode-command-set.test.mjs           |  79 +++++++++++++++
+ test/opencode-dispatch.test.mjs              | 124 ++++++++++++++++++++++++
+ 15 files changed, 1143 insertions(+), 18 deletions(-)
+
+diff --git a/.opencode/agent/superspec.md b/.opencode/agent/superspec.md
+new file mode 100644
+index 0000000..0c4c06c
+--- /dev/null
++++ b/.opencode/agent/superspec.md
+@@ -0,0 +1,32 @@
++---
++description: "SuperSpec workflow agent: shared tool-permission profile for the superspec-explore, superspec-propose, superspec-tasks, superspec-apply, and superspec-archive commands."
++mode: all
++permission:
++  edit: allow
++  read: allow
++  bash:
++    "openspec *": allow
++    "node *": allow
++    "git *": allow
++    "*": ask
++  task: allow
++---
++
++You execute one of SuperSpec's five workflow commands
++(`superspec-explore`, `superspec-propose`, `superspec-tasks`,
++`superspec-apply`, `superspec-archive`). Follow the command prompt's own
++preflight, steps, and guardrails exactly — this agent definition only
++carries the tool-permission profile shared across all five; it adds no
++workflow behavior of its own.
++
++Permissions summary:
++- `openspec`, `node`, and `git` shell commands are allowed outright — every
++  SuperSpec command relies on `openspec` CLI calls, `node
++  scripts/superspec-lint.mjs`, and (for `superspec-apply`) `git` to record
++  and diff commits.
++- Other shell commands fall back to asking, since no SuperSpec command
++  needs a broader shell surface.
++- File read/edit and subagent dispatch (`task`) are allowed outright —
++  `superspec-apply` is the only command that dispatches subagents
++  (implementer, task-reviewer, final-reviewer), but the permission is
++  harmless for the other four commands, which simply never exercise it.
+diff --git a/.opencode/command/superspec-apply.md b/.opencode/command/superspec-apply.md
+new file mode 100644
+index 0000000..a4e73ba
+--- /dev/null
++++ b/.opencode/command/superspec-apply.md
+@@ -0,0 +1,140 @@
++---
++description: "Dispatch one fresh implementer subagent per task with a per-task TDD cycle, review each against its scenarios, then run an adversarial whole-change review that gates archive."
++agent: superspec
++---
++
++Implement a SuperSpec change task-by-task: fresh implementer subagent per
++task (per-task RED/GREEN/REFACTOR across all of that task's scenarios),
++fresh reviewer subagent per task (scenario compliance + quality), then one
++adversarial whole-change reviewer after every task is approved. The final
++reviewer's verdict gates `/superspec-archive`.
++
++**Input**: Optionally a change name via `$ARGUMENTS`. If omitted, infer
++from context; if ambiguous, run `openspec list --json` and ask the user
++directly.
++
++**Preflight**
++
++1. Confirm this is a git repository (`git rev-parse --is-inside-work-tree`).
++   Task review and the final review both work from git diffs — if this
++   isn't a git repo, stop and ask whether to `git init` before continuing.
++
++2. Select the change, confirm schema is `superspec` via
++   `openspec status --change "<name>" --json`, and confirm the `tasks`
++   artifact is `done` (tasks.md exists). If not, stop and point at
++   `/superspec-tasks`.
++
++3. Run the semantic lint before touching any code:
++   ```bash
++   node scripts/superspec-lint.mjs "<name>"
++   ```
++   If it fails, stop. Implementing against an inconsistent tasks.md
++   produces work that doesn't match what tasks.md claims — fix it via
++   `/superspec-tasks` first, don't patch around a failing lint here.
++
++4. Record `CHANGE_BASE_SHA` = current `git rev-parse HEAD` — the commit
++   before Task 1. This is the base for the final review's diff; never
++   derive it as `HEAD~N`, which silently drops commits if a task makes more
++   than one.
++
++5. Check for an existing ledger at `openspec/changes/<name>/progress.md`.
++   Tasks it lists as complete are done — skip re-dispatching them, resume
++   at the first task not marked complete. This file is scoped to this
++   change specifically so it never collides with another change's progress.
++
++**Per-Task Loop** (sequential — never dispatch implementers for two tasks
++in parallel; the review loop and TDD cycle assume one task in flight)
++
++For each pending task in `tasks.md`, in order:
++
++1. Resolve the task's delta-spec section: using the scenario IDs, spec
++   names, and scenario names recorded on the task's line and its indented
++   sub-bullets, pull the exact verbatim GIVEN/WHEN/THEN text and the owning
++   `### Requirement:` block(s) from the relevant `specs/<capability>/spec.md`
++   file. This is all the subagent gets from the spec — no proposal.md.
++
++2. Record `TASK_BASE_SHA` = current `git rev-parse HEAD`.
++
++3. Dispatch an implementer subagent using
++   `.opencode/superspec/implementer-prompt.md`, filled with this task's
++   scenarios, requirement block(s), test file path (from the task's
++   `[test: ...]` tag), and a report file path
++   (`openspec/changes/<name>/reports/task-<TASK_ID>-report.md`, e.g.
++   `task-T1-report.md` — always the task's `T`-prefixed ID, never a bare
++   loop index).
++
++4. **Handle implementer status:**
++   - **DONE / DONE_WITH_CONCERNS**: proceed to review. For CONCERNS, read
++     them first — address correctness/scope doubts before dispatching the
++     reviewer, note-and-proceed for pure observations.
++   - **NEEDS_CONTEXT**: provide what's missing, re-dispatch the same subagent.
++   - **BLOCKED**: assess why. Context gap → provide it and re-dispatch.
++     Needs more reasoning → this project has no model-tiering config, so
++     re-dispatch is on the same model with a more explicit brief. Task
++     genuinely too large → this is a grouping problem, stop and point at
++     `/superspec-tasks` for regeneration, don't split it yourself here.
++
++5. Generate the review package: `git diff --stat` and `git diff -U10` for
++   `TASK_BASE_SHA..HEAD`, written to
++   `openspec/changes/<name>/reports/task-<TASK_ID>-diff.txt`.
++
++6. Dispatch a task reviewer using
++   `.opencode/superspec/task-reviewer-prompt.md`, filled with the same
++   scenario/requirement text the implementer got, the report file, and the
++   diff file.
++
++7. **On "Needs fixes"**: dispatch the same implementer subagent lineage
++   with the complete findings list (all Critical/Important items — not one
++   fixer call per finding), then re-review. Loop until Approved. Never
++   proceed with open Critical/Important issues.
++
++8. **On Approved**: mark the task's checkbox `- [x]` in tasks.md, and
++   append one line to `openspec/changes/<name>/progress.md`:
++   `Task <TASK_ID>: complete (commits <base7>..<head7>, review approved)`.
++
++9. Continue to the next pending task without pausing to check in. Stop
++   only for: a BLOCKED status you can't resolve, ambiguity that genuinely
++   blocks progress, or all tasks complete.
++
++**Final Review** (once every task is complete and approved)
++
++1. Concatenate every `specs/**/*.md` delta file in the change into
++   `<FULL_DELTA_SPEC>`.
++
++2. Generate the whole-change diff: `git diff --stat` and `git diff -U10`
++   for `CHANGE_BASE_SHA..HEAD`, written to
++   `openspec/changes/<name>/final-review-diff.txt`.
++
++3. Dispatch the final reviewer using
++   `.opencode/superspec/final-reviewer-prompt.md` — fresh subagent, no
++   proposal.md, the full delta spec, tasks.md, and the diff file.
++
++4. Write its full report to `openspec/changes/<name>/final-review.md`.
++
++5. **On the verdict:**
++   - **Approved**: report the change as archive-ready. `/superspec-archive`
++     will check this same file before running.
++   - **Needs fixes**: dispatch ONE fix subagent with the complete findings
++     list, re-run the final review against the new diff, loop until Approved.
++   - **Needs tasks.md regeneration**: STOP. Tell the user directly — the
++     grouping this review found doesn't match how the change actually
++     came together, and `/superspec-tasks` needs to regenerate it. Do not
++     silently replan `tasks.md` yourself.
++
++**Guardrails**
++- One implementer subagent in flight at a time — never parallel
++- Never skip a task review, and never accept a report missing either
++  verdict half (scenario compliance AND quality)
++- Never move to the next task with open Critical/Important issues
++- The ledger (`progress.md`) lives inside `openspec/changes/<name>/` —
++  never write it to a global or repo-root location
++- The final reviewer never receives proposal.md — it judges the delta
++  spec only
++- Don't dispatch a fix for a "Needs tasks.md regeneration" verdict — that
++  path ends in a stop, not a fix loop
++
++**Output**
++
++Report progress per task as it completes (task N/M, status, one-line test
++summary), and a final summary: total tasks, ledger state, final review
++verdict, and whether `/superspec-archive` is unblocked.
+diff --git a/.opencode/command/superspec-archive.md b/.opencode/command/superspec-archive.md
+new file mode 100644
+index 0000000..a1ccc26
+--- /dev/null
++++ b/.opencode/command/superspec-archive.md
+@@ -0,0 +1,45 @@
++---
++description: "Archive a completed SuperSpec change, blocked until its final whole-change review reports Approved."
++agent: superspec
++---
++
++Archive a completed SuperSpec change. This is a thin wrapper around
++`openspec archive`, with one real check in front of it: the change's
++`/superspec-apply` final review must have approved it.
++
++**Input**: Optionally a change name via `$ARGUMENTS`. If omitted, infer
++from context; if ambiguous, run `openspec list --json` and ask the user
++directly.
++
++**Steps**
++
++1. **Select the change**, confirm its schema is `superspec`:
++   ```bash
++   openspec status --change "<name>" --json
++   ```
++
++2. **Check the final review gate.** Read
++   `openspec/changes/<name>/final-review.md`.
++   - **Missing**: stop. `/superspec-apply` hasn't produced a final review
++     for this change yet — either it hasn't been run, or not every task is
++     complete. Point at `/superspec-apply`.
++   - **Present but its most recent "Change quality:" verdict is not
++     Approved**: stop. Report the verdict (`Needs fixes` or
++     `Needs tasks.md regeneration`) and what it means — don't archive an
++     unapproved change, and don't try to resolve the finding yourself here.
++   - **Approved**: proceed.
++
++3. **Archive:**
++   ```bash
++   openspec archive "<name>"
++   ```
++
++4. **Report** the result: which capabilities' base specs were
++   updated/created, and the change's new archived location.
++
++**Guardrails**
++- Never run `openspec archive` without first confirming an Approved final
++  review — this is the one thing that makes this command more than a
++  shell wrapper, don't skip it under time pressure
++- Don't attempt to fix a non-Approved verdict yourself — that's
++  `/superspec-apply`'s fix loop, not this command's job
+diff --git a/.opencode/command/superspec-explore.md b/.opencode/command/superspec-explore.md
+new file mode 100644
+index 0000000..445dbb0
+--- /dev/null
++++ b/.opencode/command/superspec-explore.md
+@@ -0,0 +1,62 @@
++---
++description: "Discovery dialogue for a SuperSpec change — think through the problem before formalizing it. Writes no artifacts."
++agent: superspec
++---
++
++Enter explore mode. Think deeply, follow the conversation wherever it goes.
++This is thinking time, not writing time.
++
++**Hard rule: this command writes no files, ever.** No `proposal.md`, no
++delta specs, no `design.md`. Not even if asked directly — if the user
++wants something captured, that's `/superspec-propose`'s job. Say so and
++move on; don't let "just this once" creep in.
++
++**Input**: `$ARGUMENTS` — whatever the user wants to think about: a vague
++idea, a specific problem, an existing change name to explore further, a
++comparison between approaches, or nothing (just enter the mode).
++
++## The Stance
++
++- **Curious, not prescriptive** — ask questions that emerge naturally
++- **Open threads, not interrogation** — surface multiple directions, let
++  the user follow what resonates
++- **Grounded** — read the actual codebase when relevant, don't theorize
++  in the abstract
++- **Patient** — let the shape of the problem emerge before reaching for structure
++
++## What You Might Do
++
++- Ask clarifying questions, challenge assumptions, reframe the problem
++- Investigate the codebase: existing architecture, integration points,
++  patterns already in use
++- Compare approaches: tradeoffs, sketches, a recommendation if asked
++- Visualize with ASCII diagrams when that clarifies more than prose would
++- Surface risks and unknowns
++
++## Context Awareness
++
++If existing changes might be relevant, check:
++```bash
++openspec list --json
++```
++If the user mentions a specific change, read its artifacts for context
++(`openspec status --change "<name>" --json`, then read files under
++`artifactPaths.<artifact>.existingOutputPaths`) — but only to inform the
++conversation, never to edit them.
++
++## Ending Discovery
++
++There's no required ending:
++- **Flows into a proposal**: "This feels solid enough to formalize — run
++  `/superspec-propose` when you're ready."
++- **Just provides clarity**: the user has what they need, moves on
++- **Continues later**: pick it back up anytime
++
++## Guardrails
++
++- **Never write files** — proposal, specs, design, tasks are all out of
++  scope here, no exceptions
++- **Don't fake understanding** — if something is unclear, dig deeper
++- **Don't rush to structure** — let patterns emerge
++- **Do ground in the real codebase** — read it when relevant
++- **Do question assumptions** — the user's and your own
+diff --git a/.opencode/command/superspec-propose.md b/.opencode/command/superspec-propose.md
+new file mode 100644
+index 0000000..9e1a7b9
+--- /dev/null
++++ b/.opencode/command/superspec-propose.md
+@@ -0,0 +1,79 @@
++---
++description: "Write proposal.md and terse GIVEN/WHEN/THEN delta specs for a new or existing SuperSpec change, gated on openspec validate --strict."
++agent: superspec
++---
++
++Create a SuperSpec change's `proposal.md` and delta spec files. Does not
++touch `design.md` or `tasks.md` — design is optional and out of scope here
++(write it by hand later if the change needs one), and `tasks.md` is
++`/superspec-tasks`'s job, run after this one.
++
++**Input**: `$ARGUMENTS` — the change name (kebab-case), or a description
++of what to build.
++
++**Steps**
++
++1. **If no input, ask what to build.** Ask the user directly (open-ended):
++   > "What change do you want to propose? Describe what you want to build or fix."
++   Derive a kebab-case name from the description. Do not proceed without
++   understanding what's being built.
++
++2. **Create the change**, if it doesn't already exist:
++   ```bash
++   openspec new change "<name>"
++   ```
++   The project's `openspec/config.yaml` defaults to the `superspec`
++   schema, so no `--schema` flag is needed. If the change already exists,
++   confirm with the user before overwriting its proposal or specs.
++
++3. **Identify capabilities.** Before writing anything, work out which
++   capabilities this change touches:
++   - **New**: kebab-case names, each becomes `specs/<name>/spec.md`
++   - **Modified**: check `openspec/specs/` for existing capability names
++     whose requirements are changing (not just implementation)
++
++4. **Write `proposal.md`** — four sections, **20 lines total, hard cap**:
++   - **Why**: 1-2 sentences — the problem or opportunity
++   - **What Changes**: bullet list, specific, mark **BREAKING** where it applies
++   - **Capabilities**: New Capabilities / Modified Capabilities, from step 3.
++     This section is not optional even under the line cap — it's the
++     contract the specs step reads next; a proposal that omits it produces
++     specs with no capability to attach to.
++   - **Impact**: affected code/APIs/dependencies, 1-3 lines
++
++   No rationale beyond the Why line — that's what the 20-line cap enforces.
++
++5. **Write delta specs**, one file per capability from step 3:
++   ```bash
++   openspec instructions specs --change "<name>" --json
++   ```
++   Read the returned `template` and `instruction` — both already carry
++   this project's terse constraint (one SHALL sentence, 1-3 scenarios,
++   GIVEN/WHEN/THEN, exactly four hashtags on scenario headers) and a
++   bloated-vs-terse example. Follow the template exactly.
++   - **New capability**: `## ADDED Requirements`
++   - **Modified capability**: read the existing `openspec/specs/<capability>/spec.md`
++     first, copy the entire requirement block being changed under
++     `## MODIFIED Requirements`, then edit it — partial content loses
++     detail at archive time
++
++6. **Validate — hard gate:**
++   ```bash
++   openspec validate "<name>" --strict
++   ```
++   If it fails, fix the proposal or specs and re-run until it passes.
++   Do not hand back a change that fails `--strict`.
++
++**Output**
++
++Summarize: change name and location, capabilities created/modified,
++proposal line count, validation result. Point to next step:
++"Run `/superspec-tasks` to derive the implementation task list."
++
++**Guardrails**
++- Proposal stays at or under 20 lines including the Capabilities section
++- Every capability named in the proposal needs a corresponding delta spec file
++- Delta specs follow the schema's template and instruction verbatim — don't
++  freehand the format
++- `--strict` failure is a hard stop, not a warning to note and move past
++- Don't create `design.md` or `tasks.md` here
+diff --git a/.opencode/command/superspec-tasks.md b/.opencode/command/superspec-tasks.md
+new file mode 100644
+index 0000000..12cc1dd
+--- /dev/null
++++ b/.opencode/command/superspec-tasks.md
+@@ -0,0 +1,112 @@
++---
++description: "Derive tasks.md from a SuperSpec change's delta specs, with explicit scenario grouping and a hard semantic-lint gate."
++agent: superspec
++---
++
++Derive `tasks.md` for a SuperSpec change: group its scenarios into tasks,
++record the grouping in machine-readable form, and gate on semantic lint.
++Grouping is decided here and only here — `/superspec-apply` reads and
++dispatches, it does not replan.
++
++**Input**: Optionally a change name via `$ARGUMENTS` (e.g.
++`/superspec-tasks token-refresh`). If omitted, infer from conversation
++context; if ambiguous, run `openspec list --json` and ask the user
++directly to let them pick. Announce "Using change: <name>".
++
++**Steps**
++
++1. **Select the change**, then confirm its schema:
++   ```bash
++   openspec status --change "<name>" --json
++   ```
++   If `schemaName` is not `superspec`, stop — this command only applies to
++   the superspec schema.
++
++   Check the `tasks` artifact's status in the `artifacts` array. If
++   `blocked`, report `missingDeps` and stop (usually means specs aren't
++   done yet). If `done`, tasks.md already exists — confirm with the user
++   before overwriting.
++
++2. **Read the source material**:
++   - `proposal.md` — for the capability list and any grouping hint it recorded
++   - Every delta spec file under `artifactPaths.specs.existingOutputPaths`
++   - `design.md` if `artifactPaths.design.existingOutputPaths` is non-empty
++     (it's optional — proceed without it if absent)
++   - The relevant parts of the actual codebase the proposal's Impact
++     section names — enough to judge what shares a fixture/test file and
++     what doesn't, and to pick realistic target test file paths that match
++     this project's existing test conventions
++   - The tasks format itself:
++     ```bash
++     openspec instructions tasks --change "<name>" --json
++     ```
++     Read the returned `template` and `instruction` — they're the
++     authoritative source for the `[scenarios: ...] [test: ...]` task-line
++     format and the 4-scenario cap. Follow them exactly; don't rely on
++     memory of what the format looked like last time you ran this — the
++     schema is what `scripts/superspec-lint.mjs` and `/superspec-apply`
++     are actually built against, so it's what wins on drift.
++
++3. **Get the authoritative scenario ID list** — never invent IDs, never
++   derive them by reading spec markdown yourself:
++   ```bash
++   node scripts/superspec-lint.mjs --list-scenarios "<name>"
++   ```
++   This prints a JSON array of `{id, spec, operation, requirementIndex,
++   requirementText}` in document order. `requirementIndex` is a global
++   1-based counter over every requirement in the change (including
++   REMOVED/RENAMED, so it reflects true document position) — it's what
++   disambiguates two requirements that happen to share identical SHALL
++   text. Only `ADDED`/`MODIFIED` requirements produce scenario entries;
++   `REMOVED`/`RENAMED` contribute none, and need no tasks.
++
++4. **Bind each scenario ID to its name and text.** Consecutive entries
++   sharing the same `requirementIndex` belong to the same requirement, in
++   order — grouping this way is exact, `requirementIndex` never collides.
++   For each such group: open the group's `spec` capability's delta file,
++   and find the `### Requirement:` block whose SHALL sentence matches
++   `requirementText`. If exactly one block in that file matches, use it.
++   If more than one matches (only possible when two requirements in the
++   same file are textually identical), disambiguate by counting
++   `### Requirement:` blocks in document order across *all* of this
++   change's delta files, in the same order `--list-scenarios` iterated
++   them, and take the one at position `requirementIndex`. Then zip that
++   requirement's `#### Scenario:` headings top-to-bottom against the
++   group's scenario IDs in order. This gives you, per ID: capability,
++   requirement block, scenario name, and verbatim GIVEN/WHEN/THEN text.
++
++5. **Group scenarios into tasks:**
++   - Group scenarios that share a test fixture or touch the same unit
++   - Split scenarios that would produce independent test files
++   - Hard cap: 4 scenarios per task
++   - Use the proposal's grouping hint as a starting point, but verify it
++     against what you actually found reading the codebase — the hint may
++     be wrong once the code's real shape is known
++
++6. **Write `tasks.md`** using the `template` from step 2, with the
++   grouping made explicit per the `[scenarios: ...] [test: ...]` format it
++   specifies. The `[scenarios: ...]` tag is required and lint-checked. The
++   `[test: ...]` tag and the indented scenario-name sub-bullets are for
++   `/superspec-apply` and for humans; they aren't lint-checked, but keep
++   them accurate — apply resolves each task's delta-spec section by
++   re-reading the ID/name/spec binding you record here, it does not
++   re-derive it.
++
++7. **Gate on semantic lint** — this is a hard failure, not a warning:
++   ```bash
++   node scripts/superspec-lint.mjs "<name>"
++   ```
++   If it fails, fix `tasks.md` yourself and re-run until it passes. Do not
++   hand back a tasks.md that fails lint.
++
++8. **Report**: schema, scenario count, task count, lint result, and the
++   task list with its scenario/test-file groupings.
++
++**Guardrails**
++- Grouping decisions belong here, not at propose or apply time
++- Every scenario ID must come from `--list-scenarios` output — never
++  hand-numbered or guessed
++- Every scenario must end up in exactly one task (lint enforces this, but
++  don't rely on lint to catch a mistake you could avoid)
++- 4-scenario cap is hard, not a suggestion
++- Don't touch proposal.md or the delta spec files — this command only writes tasks.md
+diff --git a/.opencode/superspec/final-reviewer-prompt.md b/.opencode/superspec/final-reviewer-prompt.md
+new file mode 100644
+index 0000000..858d2de
+--- /dev/null
++++ b/.opencode/superspec/final-reviewer-prompt.md
+@@ -0,0 +1,99 @@
++# SuperSpec Final (Whole-Change) Reviewer Prompt Template
++
++Dispatch once via the Task tool, `subagent_type: general`, fresh context, no
++proposal.md — after every task in the change has an Approved task review,
++before `/superspec-archive` is allowed to run. This gate is adversarial by
++design: an independent context catches what per-task review structurally
++cannot, because per-task review never sees the whole diff. (OpenCode's Task
++tool currently only accepts `subagent_type` of `explore`, `general`, or the
++primary agent's own name — custom-named subagents aren't dispatchable that
++way yet — so the role comes entirely from the filled prompt below, not from
++the dispatch call.)
++
++```
++description: "Final review: SuperSpec change <CHANGE_ID>"
++prompt: |
++  You are the final, whole-change reviewer for SuperSpec change
++  <CHANGE_ID>. Every task already passed an individual task review; your
++  job is what task-scoped review cannot see: whether the change holds
++  together once every task's work is combined.
++
++  ## The Contract
++
++  Full delta spec for this change — every requirement, every scenario,
++  verbatim: <FULL_DELTA_SPEC>
++
++  tasks.md, as implemented: <TASKS_FILE>
++
++  You do not have proposal.md. Judge against the delta spec only — it is
++  the contract this change is held to, not the "why" behind it.
++
++  ## Diff Under Review
++
++  Base: <BASE_SHA> (commit before Task 1)  Head: <HEAD_SHA> (current)
++  Diff file: <DIFF_FILE>
++
++  Read the diff file once. Do not re-run git commands beyond what's needed
++  to inspect a specific named risk. Do not mutate the working tree.
++
++  ## What to Check
++
++  1. **Scenario-to-test fidelity, whole-change.** For every scenario in
++     the delta spec, does its test genuinely assert the described
++     GIVEN/WHEN/THEN behavior? Re-checking this deliberately overlaps
++     per-task review: a test that looked fine in isolation can be shallow
++     once you see the whole picture — e.g. two tasks' tests each pass
++     without ever exercising the interaction between what they built.
++  2. **Cross-task damage.** Duplicated logic across tasks, inconsistent
++     interfaces between components different tasks touched, a MODIFIED
++     requirement's old behavior replaced at one call site but not another.
++  3. **Whole-diff code quality.** Clean separation, DRY without premature
++     abstraction, real assertions (not mocks of the thing under test), no
++     dead code, no overbuilding relative to the delta spec.
++  4. **Grouping validity.** Does the diff suggest tasks.md grouped
++     scenarios wrong — e.g. two scenarios sharing a task actually needed
++     separate fixtures or files? Report this separately from ordinary
++     findings; it blocks differently (see Assessment).
++
++  ## Output Format
++
++  ### Scenario Fidelity
++  List only scenarios with something wrong — ✅ blanket coverage isn't
++  useful here, this section is exceptions. ❌ with file:line evidence for
++  each.
++
++  ### Cross-Task Findings
++  Critical / Important / Minor, file:line, why it matters.
++
++  ### Grouping Findings
++  Explicit call-out if tasks.md should be regenerated with different
++  grouping. Empty if none.
++
++  ### Assessment
++  **Change quality:** Approved | Needs fixes | Needs tasks.md regeneration
++  **Reasoning:** [1-2 sentences]
++```
++
++**On the verdict:**
++- **Approved** — the controller reports the change as archive-ready.
++- **Needs fixes** — the controller dispatches ONE fix subagent with the
++  complete findings list (not one fixer per finding), then re-runs this
++  same review. Loop until Approved.
++- **Needs tasks.md regeneration** — the controller does NOT auto-replan.
++  Stop and tell the human partner: the grouping found here doesn't match
++  what actually happened, and `/superspec-tasks` needs to be re-run before
++  continuing. Silently re-planning breaks tasks.md as a record of what was
++  actually done.
++
++**Placeholders:**
++- `<FULL_DELTA_SPEC>` — every `specs/**/*.md` file in the change, concatenated
++- `<TASKS_FILE>` — `openspec/changes/<CHANGE_ID>/tasks.md`
++- `<BASE_SHA>` / `<HEAD_SHA>` — the commit recorded before Task 1 through
++  the current HEAD
++- `<DIFF_FILE>` — written to `openspec/changes/<CHANGE_ID>/final-review-diff.txt`
++  before dispatch
++
++**Report location:** the reviewer's full report is written by the
++controller to `openspec/changes/<CHANGE_ID>/final-review.md` — its own
++file in the change directory. `/superspec-archive` reads this file and
++refuses to run unless the most recent verdict is Approved.
+diff --git a/.opencode/superspec/implementer-prompt.md b/.opencode/superspec/implementer-prompt.md
+new file mode 100644
+index 0000000..8dc3834
+--- /dev/null
++++ b/.opencode/superspec/implementer-prompt.md
+@@ -0,0 +1,118 @@
++# SuperSpec Implementer Subagent Prompt Template
++
++Dispatch via the Task tool, `subagent_type: general`, fresh context.
++(OpenCode's Task tool currently only accepts `subagent_type` of `explore`,
++`general`, or the primary agent's own name — custom-named subagents aren't
++dispatchable that way yet — so the role comes entirely from the filled
++prompt below, not from the dispatch call.)
++
++```
++description: "Implement Task <TASK_ID>: <TASK_DESCRIPTION>"
++prompt: |
++  You are implementing Task <TASK_ID> of SuperSpec change <CHANGE_ID>.
++
++  ## Your scenarios (verbatim — this is your spec)
++
++  <One block per scenario in this task:>
++  ### Scenario <SCENARIO_ID>: <SCENARIO_NAME>
++  <GIVEN/WHEN/THEN, copied verbatim from the delta spec — do not paraphrase>
++
++  ## Requirement(s) these scenarios belong to
++
++  <The full "### Requirement: ..." block(s) that own this task's scenarios,
++  verbatim from the delta spec. Nothing else from the spec file, and no
++  proposal.md — you do not need the "why," only the "what."
++
++  ## Test File
++
++  Target: <TEST_FILE_PATH>
++  <If the file/module doesn't exist yet, create it. If codebase conventions
++  suggest a different path, use your judgment and note it in your report.>
++
++  ## Before You Begin
++
++  If any scenario or requirement above is ambiguous, ask now — before
++  writing anything. Don't guess.
++
++  ## TDD Cycle — per task, not per scenario
++
++  NO IMPLEMENTATION CODE UNTIL EVERY SCENARIO ABOVE HAS A FAILING TEST.
++
++  1. **RED**: write one test per scenario above. Test name = scenario name,
++     verbatim. Run all of them. Every one MUST fail, and fail for the
++     expected reason (feature missing — not a typo, not wrong test setup).
++     Do not write implementation code yet, even to make one scenario's
++     test pass while you finish writing the others.
++  2. **Verify RED** (mandatory, never skip): confirm each failure message
++     is the one you expect. A test that errors instead of fails, or passes
++     immediately, means fix the test before proceeding.
++  3. **GREEN**: once all of this task's scenario tests are written and
++     observed failing, implement the minimal code to make all of them
++     pass. Don't add behavior beyond what the scenarios require.
++  4. **Verify GREEN** (mandatory): run the full set again. All green,
++     other tests in the suite still pass, output pristine (no stray
++     warnings).
++  5. **REFACTOR**: clean up once, tests staying green. Don't add behavior
++     here either.
++
++  Violating the letter of this cycle is violating its spirit. If you catch
++  yourself writing S2's test after already fixing S1's implementation,
++  that's the cycle broken — stop, and restart from RED for the task.
++
++  ## When You're in Over Your Head
++
++  It's always OK to stop and say "this is too hard for me." Bad work is
++  worse than no work.
++
++  **Stop and escalate when:**
++  - A scenario or requirement is ambiguous and you can't resolve it alone
++  - The task needs architectural decisions beyond what the requirement specifies
++  - You're rereading files without progress trying to understand the system
++
++  **How:** report status BLOCKED or NEEDS_CONTEXT, with specifics on what
++  you're stuck on and what you've tried.
++
++  ## Self-Review Before Reporting
++
++  - Every scenario above has a named test, and every named test maps to
++    exactly one scenario ID (no test covering two scenarios at once)
++  - Tests assert real behavior — not mocks of the thing under test
++  - No scope creep: you touched only what these scenarios and requirements
++    require, nothing extra
++  - Output pristine
++
++  ## After Review Findings
++
++  If a reviewer sends this back, fix the findings, re-run the tests that
++  cover the amended code, and append RED/GREEN evidence for the fix to
++  your report file. The reviewer will not re-run tests for you.
++
++  ## Report Format
++
++  Write your full report to <REPORT_FILE>:
++  - RED evidence per scenario: command run, failing output, why it was expected
++  - GREEN evidence: command run, passing output
++  - Files changed
++  - Test names added, keyed by scenario ID (e.g. "S1 -> 'rejects an expired
++    refresh token'")
++  - Self-review findings, concerns
++
++  Then reply with ONLY (under 15 lines — detail lives in the report file):
++  - **Status:** DONE | DONE_WITH_CONCERNS | BLOCKED | NEEDS_CONTEXT
++  - Test names added, keyed by scenario ID
++  - One-line test summary (e.g. "2/2 passing, output pristine")
++  - Concerns, if any
++  - The report file path
++
++  Use DONE_WITH_CONCERNS if you completed the work but have doubts about
++  correctness. Never silently produce work you're unsure about.
++```
++
++**Placeholders:**
++- `<TASK_ID>`, `<TASK_DESCRIPTION>` — from tasks.md
++- `<CHANGE_ID>` — the change being implemented
++- Per-scenario `<SCENARIO_ID>`, `<SCENARIO_NAME>`, GIVEN/WHEN/THEN — resolved
++  from the delta spec using the scenario→requirement mapping tasks.md records
++- `<REQUIREMENT_BLOCK>` — the owning requirement(s), verbatim, nothing more
++- `<TEST_FILE_PATH>` — from the task's `[test: ...]` tag in tasks.md
++- `<REPORT_FILE>` — `openspec/changes/<CHANGE_ID>/reports/task-<TASK_ID>-report.md`
+diff --git a/.opencode/superspec/task-reviewer-prompt.md b/.opencode/superspec/task-reviewer-prompt.md
+new file mode 100644
+index 0000000..a02f928
+--- /dev/null
++++ b/.opencode/superspec/task-reviewer-prompt.md
+@@ -0,0 +1,96 @@
++# SuperSpec Task Reviewer Prompt Template
++
++Dispatch via the Task tool, `subagent_type: general`, fresh context.
++(OpenCode's Task tool currently only accepts `subagent_type` of `explore`,
++`general`, or the primary agent's own name — custom-named subagents aren't
++dispatchable that way yet — so the role comes entirely from the filled
++prompt below, not from the dispatch call.)
++This is a task-scoped gate — the final whole-change review happens once,
++separately, after every task passes this gate.
++
++```
++description: "Review Task <TASK_ID> (scenario compliance + quality)"
++prompt: |
++  You are reviewing one task's implementation against its scenarios: first
++  whether every scenario is genuinely covered, then whether the code is
++  well-built. This is a task-scoped gate, not the final review.
++
++  ## What Was Requested
++
++  Scenarios (verbatim): <SCENARIO_TEXT_BLOCK>
++
++  Requirement(s) these scenarios belong to: <REQUIREMENT_BLOCK>
++
++  ## What the Implementer Claims
++
++  Read the implementer's report: <REPORT_FILE>
++
++  ## Diff Under Review
++
++  Base: <BASE_SHA>  Head: <HEAD_SHA>  Diff file: <DIFF_FILE>
++
++  Read the diff file once — it is your view of the change. Do not re-run
++  git commands. Do not mutate the working tree, index, or HEAD.
++
++  ## Do Not Trust the Report
++
++  Treat the implementer's report as unverified claims. Verify test names,
++  RED/GREEN evidence, and "files changed" against the actual diff. A
++  stated rationale in the report never downgrades a finding's severity.
++
++  ## Part 1: Scenario Compliance
++
++  For each scenario ID in this task:
++  - Does a named test exist for it?
++  - Does that test actually assert the GIVEN/WHEN/THEN behavior described
++    — not just share a similar name?
++  - **Missing:** a scenario with no real test
++  - **Misnamed/mismatched:** test exists but doesn't verify the stated behavior
++  - **Extra:** functionality beyond what these scenarios and requirements specify
++
++  ## Part 2: Code Quality
++
++  - Clean separation of concerns, proper error handling, DRY without
++    premature abstraction, edge cases handled
++  - Tests verify real behavior, not mocks of the thing under test
++  - Structure: does each file have one clear responsibility?
++
++  Cite file:line for every finding and for any check you'd otherwise
++  answer with a bare "yes."
++
++  ## Calibration
++
++  Not everything is Critical. Important = this task cannot be trusted
++  until fixed (missing scenario coverage, fragile behavior, a test that
++  asserts nothing). Minor = polish, broader coverage suggestions.
++  Acknowledge what was done well before listing issues.
++
++  ## Output Format
++
++  ### Scenario Compliance
++  - ✅/❌ per scenario ID, with file:line evidence for each
++
++  ### Strengths
++
++  ### Issues
++  #### Critical (Must Fix)
++  #### Important (Should Fix)
++  #### Minor (Nice to Have)
++
++  ### Assessment
++  **Task quality:** Approved | Needs fixes
++  **Reasoning:** [1-2 sentences]
++```
++
++**Placeholders:**
++- `<TASK_ID>` — from tasks.md
++- `<SCENARIO_TEXT_BLOCK>`, `<REQUIREMENT_BLOCK>` — same content the implementer received
++- `<REPORT_FILE>` — the implementer's report file
++- `<BASE_SHA>` / `<HEAD_SHA>` — commit range for this task's commits
++- `<DIFF_FILE>` — `git diff --stat` + `git diff -U10` for the range,
++  written to `openspec/changes/<CHANGE_ID>/reports/task-<TASK_ID>-diff.txt`
++  before dispatch (never entering the controller's own context)
++
++**Reviewer returns:** Scenario Compliance verdict per scenario, Strengths,
++Issues (Critical/Important/Minor), Task quality verdict. A fix dispatch
++addresses all findings together; re-review after fixes covers both parts.
+diff --git a/README.md b/README.md
+index afababe..2f46c15 100644
+--- a/README.md
++++ b/README.md
+@@ -1,14 +1,14 @@
+ # SuperSpec
+ 
+ A spec-driven development workflow that wraps the [OpenSpec](https://github.com/Fission-AI/OpenSpec)
+-CLI with TDD discipline and subagent-based implementation, for Claude Code.
++CLI with TDD discipline and subagent-based implementation, for Claude Code and OpenCode.
+ 
+ The core idea: **a Given/When/Then scenario and a test case are the same object.**
+ Requirements are terse (one SHALL sentence, 1-3 scenarios) and every scenario
+ maps to exactly one named test, enforced by a semantic lint script that runs
+ alongside `openspec validate --strict`.
+ 
+ > **This is alpha software.** It dispatches an unbounded number of subagents
+ > in a loop and will happily burn through a large number of tokens doing so.
+ > It has not been proven not to set your house on fire. Use it on a system
+ > you're prepared to lose, review what it's about to do before you approve
+@@ -22,41 +22,47 @@ Into an existing repository (installs into the current directory by default):
+ ```bash
+ curl -fsSL https://raw.githubusercontent.com/mafeka/superspecs/main/install.sh | bash
+ ```
+ 
+ Or with `npx`:
+ 
+ ```bash
+ npx github:mafeka/superspecs
+ ```
+ 
+-Both accept a target directory and `--force` (overwrite files already installed):
++Both accept a target directory, `--force` (overwrite files already installed), and
++`--host <claude|opencode|all>` (default `all`) to restrict which host's command
++set gets installed:
+ 
+ ```bash
+ curl -fsSL https://raw.githubusercontent.com/mafeka/superspecs/main/install.sh | bash -s -- /path/to/repo --force
+ npx github:mafeka/superspecs /path/to/repo --force
++npx github:mafeka/superspecs /path/to/repo --host opencode
+ ```
+ 
+ **Requirements in the target repo:** `git`, `node` (>= 18), and either the
+ `openspec` CLI on `PATH` or a `package.json` the installer can add it to as a
+ devDependency. The target should be (or become) a git repository —
+ `/superspec-apply`'s task and final reviews both work from `git diff`.
+ 
+ The installer is idempotent: re-running it skips files that already exist
+-unless `--force` is passed. It will:
++unless `--force` is passed. By default it installs the command set for both
++hosts; pass `--host claude` or `--host opencode` to install just one. It will:
+ 
+ - Add `openspec/schemas/superspec/` — the forked OpenSpec schema enforcing
+   the terse requirement format
+ - Add `scripts/superspec-lint.mjs` — the semantic lint (scenario coverage,
+   task-size cap, one-sentence requirements)
+-- Add `.claude/commands/superspec-*.md` — the five slash commands below
+-- Add `.claude/superspec/` — subagent dispatch prompt templates used by `/superspec-apply`
++- Add `.claude/commands/superspec-*.md` — the five slash commands below (Claude Code; skipped with `--host opencode`)
++- Add `.claude/superspec/` — subagent dispatch prompt templates used by `/superspec-apply` (Claude Code; skipped with `--host opencode`)
++- Add `.opencode/command/superspec-*.md` — the five commands below (OpenCode; skipped with `--host claude`)
++- Add `.opencode/agent/superspec.md` and `.opencode/superspec/` — the OpenCode agent and its dispatch prompt templates (OpenCode; skipped with `--host claude`)
+ - Run `openspec init` if the target has no `openspec/` root yet
+ - Set `openspec/config.yaml`'s default schema to `superspec`
+ 
+ ## Commands
+ 
+ | Command | Behavior |
+ |---|---|
+ | `/superspec-explore` | Discovery dialogue. Writes no artifacts. |
+ | `/superspec-propose` | Writes `proposal.md` and terse delta specs, gated on `openspec validate --strict`. |
+ | `/superspec-tasks` | Derives `tasks.md` with explicit scenario grouping, gated on the semantic lint. |
+diff --git a/bin/install.js b/bin/install.js
+index 73c9134..220c678 100755
+--- a/bin/install.js
++++ b/bin/install.js
+@@ -8,54 +8,80 @@
+ //   node bin/install.js [target-dir] [--force]
+ //   npx github:mafeka/superspecs [target-dir] [--force]
+ 
+ import { existsSync, mkdirSync, cpSync, readFileSync, writeFileSync } from 'node:fs';
+ import { dirname, join, resolve } from 'node:path';
+ import { fileURLToPath } from 'node:url';
+ import { execFileSync, spawnSync } from 'node:child_process';
+ 
+ const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
+ 
+-const PAYLOAD_PATHS = [
++const SHARED_PAYLOAD_PATHS = [
+   'openspec/schemas/superspec',
+   'scripts/superspec-lint.mjs',
++];
++
++const CLAUDE_PAYLOAD_PATHS = [
+   '.claude/commands/superspec-explore.md',
+   '.claude/commands/superspec-propose.md',
+   '.claude/commands/superspec-tasks.md',
+   '.claude/commands/superspec-apply.md',
+   '.claude/commands/superspec-archive.md',
+   '.claude/superspec',
+ ];
+ 
++const OPENCODE_PAYLOAD_PATHS = [
++  '.opencode/command/superspec-explore.md',
++  '.opencode/command/superspec-propose.md',
++  '.opencode/command/superspec-tasks.md',
++  '.opencode/command/superspec-apply.md',
++  '.opencode/command/superspec-archive.md',
++  '.opencode/agent/superspec.md',
++  '.opencode/superspec',
++];
++
++const VALID_HOSTS = ['claude', 'opencode', 'all'];
++
+ function log(message) {
+   console.log(`[superspecs] ${message}`);
+ }
+ 
+ function fail(message) {
+   console.error(`[superspecs] ERROR: ${message}`);
+   process.exit(1);
+ }
+ 
+ function commandExists(cmd) {
+   const probe = process.platform === 'win32' ? 'where' : 'which';
+   return spawnSync(probe, [cmd], { stdio: 'ignore' }).status === 0;
+ }
+ 
+ function run(cmd, args, cwd) {
+   execFileSync(cmd, args, { stdio: 'inherit', cwd });
+ }
+ 
+ function parseArgs(argv) {
+   const force = argv.includes('--force');
+-  const positional = argv.filter((a) => !a.startsWith('--'));
++
++  const hostFlagIndex = argv.indexOf('--host');
++  const host = hostFlagIndex === -1 ? 'all' : argv[hostFlagIndex + 1];
++  if (!VALID_HOSTS.includes(host)) {
++    fail(`Invalid --host value: ${host}. Expected one of: ${VALID_HOSTS.join(', ')}`);
++  }
++
++  const positional = argv.filter((a, i) => {
++    if (a.startsWith('--')) return false;
++    if (i === hostFlagIndex + 1 && hostFlagIndex !== -1) return false; // the --host value itself
++    return true;
++  });
+   const target = positional[0] ? resolve(positional[0]) : process.cwd();
+-  return { target, force };
++  return { target, force, host };
+ }
+ 
+ function ensureGit(target) {
+   if (!commandExists('git')) {
+     fail('git is required (task review and the final review in /superspec-apply both work from git diffs).');
+   }
+   if (!existsSync(join(target, '.git'))) {
+     log('Target is not a git repository yet.');
+     log('/superspec-apply requires one — run `git init` there before using it. Continuing with the rest of setup.');
+   }
+@@ -78,31 +104,42 @@ function resolveOpenspecBin(target) {
+     if (existsSync(localBin)) return localBin;
+     fail('Installed @fission-ai/openspec but could not find its binary at node_modules/.bin/openspec afterward.');
+   }
+ 
+   fail(
+     'openspec CLI not found, and there is no package.json in the target to add it to.\n' +
+     '  Install it with `npm install -g @fission-ai/openspec` and re-run this installer.'
+   );
+ }
+ 
+-function ensureOpenspecRoot(openspecBin, target) {
++function toolsForHost(host) {
++  if (host === 'claude') return 'claude';
++  if (host === 'opencode') return 'opencode';
++  return 'claude,opencode';
++}
++
++function ensureOpenspecRoot(openspecBin, target, host) {
+   if (existsSync(join(target, 'openspec'))) {
+     log('openspec/ already exists — skipping `openspec init`.');
+     return;
+   }
+-  log('Running `openspec init --tools claude`...');
+-  run(openspecBin, ['init', '.', '--tools', 'claude'], target);
++  const tools = toolsForHost(host);
++  log(`Running \`openspec init --tools ${tools}\`...`);
++  run(openspecBin, ['init', '.', '--tools', tools], target);
+ }
+ 
+-function installPayload(target, force) {
+-  for (const rel of PAYLOAD_PATHS) {
++function installPayload(target, force, host) {
++  const paths = [...SHARED_PAYLOAD_PATHS];
++  if (host === 'claude' || host === 'all') paths.push(...CLAUDE_PAYLOAD_PATHS);
++  if (host === 'opencode' || host === 'all') paths.push(...OPENCODE_PAYLOAD_PATHS);
++
++  for (const rel of paths) {
+     const src = join(PACKAGE_ROOT, rel);
+     const dest = join(target, rel);
+ 
+     if (!existsSync(src)) {
+       fail(`Missing expected source path in this package: ${rel}`);
+     }
+     if (existsSync(dest) && !force) {
+       log(`Skipping ${rel} (already exists — pass --force to overwrite)`);
+       continue;
+     }
+@@ -132,31 +169,31 @@ function setDefaultSchema(target) {
+     log('openspec/config.yaml already defaults to `superspec`.');
+   }
+ }
+ 
+ function validateSchema(openspecBin, target) {
+   log('Validating the superspec schema...');
+   run(openspecBin, ['schema', 'validate', 'superspec'], target);
+ }
+ 
+ function main() {
+-  const { target, force } = parseArgs(process.argv.slice(2));
++  const { target, force, host } = parseArgs(process.argv.slice(2));
+ 
+   if (!existsSync(target)) {
+     fail(`Target directory does not exist: ${target}`);
+   }
+ 
+-  log(`Installing into ${target}${force ? ' (--force: overwriting existing files)' : ''}`);
++  log(`Installing into ${target}${force ? ' (--force: overwriting existing files)' : ''} [host: ${host}]`);
+ 
+   ensureGit(target);
+   const openspecBin = resolveOpenspecBin(target);
+-  ensureOpenspecRoot(openspecBin, target);
+-  installPayload(target, force);
++  ensureOpenspecRoot(openspecBin, target, host);
++  installPayload(target, force, host);
+   setDefaultSchema(target);
+   validateSchema(openspecBin, target);
+ 
+   log('Done.');
+   log('Restart your IDE (or reload the Claude Code window) to pick up the new slash commands.');
+   log('Then try: /superspec-explore, /superspec-propose, /superspec-tasks, /superspec-apply, /superspec-archive');
+ }
+ 
+ main();
+diff --git a/package.json b/package.json
+index 293c84f..45e755f 100644
+--- a/package.json
++++ b/package.json
+@@ -1,27 +1,37 @@
+ {
+   "name": "superspecs",
+   "version": "0.1.0",
+   "description": "SuperSpec: a spec-driven development workflow wrapping the openspec CLI with TDD discipline and subagent-based implementation.",
+   "type": "module",
++  "scripts": {
++    "test": "node --test \"test/**/*.test.mjs\""
++  },
+   "bin": {
+     "superspecs": "bin/install.js"
+   },
+   "files": [
+     "bin",
+     "openspec/schemas/superspec",
+     "scripts/superspec-lint.mjs",
+     ".claude/commands/superspec-explore.md",
+     ".claude/commands/superspec-propose.md",
+     ".claude/commands/superspec-tasks.md",
+     ".claude/commands/superspec-apply.md",
+     ".claude/commands/superspec-archive.md",
+-    ".claude/superspec"
++    ".claude/superspec",
++    ".opencode/command/superspec-explore.md",
++    ".opencode/command/superspec-propose.md",
++    ".opencode/command/superspec-tasks.md",
++    ".opencode/command/superspec-apply.md",
++    ".opencode/command/superspec-archive.md",
++    ".opencode/agent/superspec.md",
++    ".opencode/superspec"
+   ],
+   "engines": {
+     "node": ">=18"
+   },
+   "repository": {
+     "type": "git",
+     "url": "git+https://github.com/mafeka/superspecs.git"
+   }
+ }
+diff --git a/test/installer-host.test.mjs b/test/installer-host.test.mjs
+new file mode 100644
+index 0000000..15bd5ba
+--- /dev/null
++++ b/test/installer-host.test.mjs
+@@ -0,0 +1,86 @@
++import { test } from 'node:test';
++import assert from 'node:assert/strict';
++import fs from 'node:fs';
++import os from 'node:os';
++import path from 'node:path';
++import { fileURLToPath } from 'node:url';
++import { execFileSync } from 'node:child_process';
++
++const __dirname = path.dirname(fileURLToPath(import.meta.url));
++const repoRoot = path.resolve(__dirname, '..');
++const installerPath = path.join(repoRoot, 'bin', 'install.js');
++
++function makeTempRepo() {
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'superspecs-installer-'));
++  execFileSync('git', ['init'], { cwd: dir, stdio: 'ignore' });
++  return dir;
++}
++
++function runInstaller(targetDir, extraArgs = []) {
++  return execFileSync('node', [installerPath, targetDir, ...extraArgs], {
++    cwd: repoRoot,
++    encoding: 'utf8',
++  });
++}
++
++test('Default installs both hosts', () => {
++  const target = makeTempRepo();
++  try {
++    runInstaller(target);
++
++    // Claude Code payload set present.
++    assert.ok(
++      fs.existsSync(path.join(target, '.claude', 'commands', 'superspec-apply.md')),
++      '.claude/commands/superspec-apply.md should be installed by default'
++    );
++    assert.ok(
++      fs.existsSync(path.join(target, '.claude', 'superspec')),
++      '.claude/superspec should be installed by default'
++    );
++
++    // OpenCode payload set present.
++    assert.ok(
++      fs.existsSync(path.join(target, '.opencode', 'command', 'superspec-apply.md')),
++      '.opencode/command/superspec-apply.md should be installed by default'
++    );
++    assert.ok(
++      fs.existsSync(path.join(target, '.opencode', 'agent', 'superspec.md')),
++      '.opencode/agent/superspec.md should be installed by default'
++    );
++    assert.ok(
++      fs.existsSync(path.join(target, '.opencode', 'superspec')),
++      '.opencode/superspec should be installed by default'
++    );
++  } finally {
++    fs.rmSync(target, { recursive: true, force: true });
++  }
++});
++
++test('Host flag restricts to one payload set', () => {
++  const target = makeTempRepo();
++  try {
++    runInstaller(target, ['--host', 'opencode']);
++
++    // OpenCode payload set present.
++    assert.ok(
++      fs.existsSync(path.join(target, '.opencode', 'command', 'superspec-apply.md')),
++      '.opencode/command/superspec-apply.md should be installed with --host opencode'
++    );
++    assert.ok(
++      fs.existsSync(path.join(target, '.opencode', 'agent', 'superspec.md')),
++      '.opencode/agent/superspec.md should be installed with --host opencode'
++    );
++    assert.ok(
++      fs.existsSync(path.join(target, '.opencode', 'superspec')),
++      '.opencode/superspec should be installed with --host opencode'
++    );
++
++    // No .claude/ at all.
++    assert.ok(
++      !fs.existsSync(path.join(target, '.claude')),
++      '.claude/ should not be created when --host opencode is passed'
++    );
++  } finally {
++    fs.rmSync(target, { recursive: true, force: true });
++  }
++});
+diff --git a/test/opencode-command-set.test.mjs b/test/opencode-command-set.test.mjs
+new file mode 100644
+index 0000000..3d6a230
+--- /dev/null
++++ b/test/opencode-command-set.test.mjs
+@@ -0,0 +1,79 @@
++import { test } from 'node:test';
++import assert from 'node:assert/strict';
++import fs from 'node:fs';
++import path from 'node:path';
++import { fileURLToPath } from 'node:url';
++
++const __dirname = path.dirname(fileURLToPath(import.meta.url));
++const repoRoot = path.resolve(__dirname, '..');
++const commandDir = path.join(repoRoot, '.opencode', 'command');
++const agentDir = path.join(repoRoot, '.opencode', 'agent');
++
++/**
++ * Minimal frontmatter splitter: expects the file to start with a `---`
++ * delimited YAML block. Returns { frontmatter, body } where frontmatter is a
++ * flat map of top-level `key: value` pairs (good enough for the scalar
++ * fields these command files use — no nested structures needed here).
++ */
++function parseFrontmatter(fileContents) {
++  const match = fileContents.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
++  assert.ok(match, 'file must start with a --- delimited frontmatter block');
++  const [, rawFrontmatter, body] = match;
++  const frontmatter = {};
++  for (const line of rawFrontmatter.split(/\r?\n/)) {
++    if (!line.trim() || line.trim().startsWith('#')) continue;
++    const idx = line.indexOf(':');
++    if (idx === -1) continue;
++    const key = line.slice(0, idx).trim();
++    let value = line.slice(idx + 1).trim();
++    // Strip surrounding quotes if present.
++    if (
++      (value.startsWith('"') && value.endsWith('"')) ||
++      (value.startsWith("'") && value.endsWith("'"))
++    ) {
++      value = value.slice(1, -1);
++    }
++    frontmatter[key] = value;
++  }
++  return { frontmatter, body };
++}
++
++test('Command inventory matches', () => {
++  const files = fs
++    .readdirSync(commandDir)
++    .filter((name) => /^superspec-.*\.md$/.test(name));
++  assert.equal(
++    files.length,
++    5,
++    `expected exactly 5 superspec-*.md command files, found ${files.length}: ${files.join(', ')}`
++  );
++});
++
++test('Frontmatter maps host-specific fields', () => {
++  const files = fs
++    .readdirSync(commandDir)
++    .filter((name) => /^superspec-.*\.md$/.test(name));
++  assert.ok(files.length > 0, 'no command files found to check');
++
++  for (const file of files) {
++    const fullPath = path.join(commandDir, file);
++    const contents = fs.readFileSync(fullPath, 'utf8');
++    const { frontmatter } = parseFrontmatter(contents);
++
++    assert.ok(
++      Object.prototype.hasOwnProperty.call(frontmatter, 'agent'),
++      `${file}: frontmatter must declare an "agent" field`
++    );
++    assert.ok(
++      !Object.prototype.hasOwnProperty.call(frontmatter, 'allowed-tools'),
++      `${file}: frontmatter must not declare "allowed-tools" (that's the Claude Code twin's field)`
++    );
++
++    const agentName = frontmatter.agent;
++    const agentFile = path.join(agentDir, `${agentName}.md`);
++    assert.ok(
++      fs.existsSync(agentFile),
++      `${file}: agent field "${agentName}" must resolve to .opencode/agent/${agentName}.md`
++    );
++  }
++});
+diff --git a/test/opencode-dispatch.test.mjs b/test/opencode-dispatch.test.mjs
+new file mode 100644
+index 0000000..1440b72
+--- /dev/null
++++ b/test/opencode-dispatch.test.mjs
+@@ -0,0 +1,124 @@
++import { test } from 'node:test';
++import assert from 'node:assert/strict';
++import fs from 'node:fs';
++import path from 'node:path';
++import { fileURLToPath } from 'node:url';
++
++const __dirname = path.dirname(fileURLToPath(import.meta.url));
++const repoRoot = path.resolve(__dirname, '..');
++const superspecDir = path.join(repoRoot, '.opencode', 'superspec');
++const applyCommandFile = path.join(
++  repoRoot,
++  '.opencode',
++  'command',
++  'superspec-apply.md'
++);
++
++/**
++ * Minimal frontmatter splitter, adapted from test/opencode-command-set.test.mjs:
++ * expects the file to start with a `---` delimited YAML block. Returns
++ * { frontmatter, body } where frontmatter is a flat map of top-level
++ * `key: value` pairs (good enough for the scalar fields these command files
++ * use — no nested structures needed here).
++ */
++function parseFrontmatter(fileContents) {
++  const match = fileContents.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
++  assert.ok(match, 'file must start with a --- delimited frontmatter block');
++  const [, rawFrontmatter, body] = match;
++  const frontmatter = {};
++  for (const line of rawFrontmatter.split(/\r?\n/)) {
++    if (!line.trim() || line.trim().startsWith('#')) continue;
++    const idx = line.indexOf(':');
++    if (idx === -1) continue;
++    const key = line.slice(0, idx).trim();
++    let value = line.slice(idx + 1).trim();
++    if (
++      (value.startsWith('"') && value.endsWith('"')) ||
++      (value.startsWith("'") && value.endsWith("'"))
++    ) {
++      value = value.slice(1, -1);
++    }
++    frontmatter[key] = value;
++  }
++  return { frontmatter, body };
++}
++
++const dispatchTemplateFiles = [
++  'implementer-prompt.md',
++  'task-reviewer-prompt.md',
++  'final-reviewer-prompt.md',
++];
++
++test('Role differentiated by prompt, not agent name', () => {
++  const contents = {};
++  for (const name of dispatchTemplateFiles) {
++    const fullPath = path.join(superspecDir, name);
++    assert.ok(
++      fs.existsSync(fullPath),
++      `expected OpenCode dispatch template ${fullPath} to exist`
++    );
++    contents[name] = fs.readFileSync(fullPath, 'utf8');
++  }
++
++  for (const name of dispatchTemplateFiles) {
++    const text = contents[name];
++
++    assert.ok(
++      text.includes('subagent_type: general') &&
++        !text.includes('subagent_type: general-purpose'),
++      `${name}: must dispatch with "subagent_type: general" (bare, not the Claude Code "general-purpose" value)`
++    );
++
++    assert.ok(
++      !text.includes('subagent_type: general-purpose'),
++      `${name}: must not use the Claude Code "general-purpose" subagent_type`
++    );
++
++    // No role-specific custom subagent_type values (e.g. "subagent_type:
++    // implementer") — OpenCode's Task tool only accepts explore, general, or
++    // the primary agent's own name, so every role must go through "general".
++    const subagentTypeLines = text
++      .split(/\r?\n/)
++      .filter((line) => /subagent_type\s*:/.test(line));
++    for (const line of subagentTypeLines) {
++      assert.match(
++        line,
++        /subagent_type:\s*general\b/,
++        `${name}: found a subagent_type line that isn't "general": "${line.trim()}"`
++      );
++    }
++  }
++
++  // The three files must be content-distinct from each other (the role
++  // comes from the prompt content, not the dispatch call, which is
++  // identical across all three).
++  const [implementer, taskReviewer, finalReviewer] = dispatchTemplateFiles.map(
++    (name) => contents[name]
++  );
++  assert.notEqual(implementer, taskReviewer);
++  assert.notEqual(implementer, finalReviewer);
++  assert.notEqual(taskReviewer, finalReviewer);
++});
++
++test('Apply command stays at nesting depth 1', () => {
++  const contents = fs.readFileSync(applyCommandFile, 'utf8');
++  const { frontmatter } = parseFrontmatter(contents);
++
++  const hasSubtask = Object.prototype.hasOwnProperty.call(
++    frontmatter,
++    'subtask'
++  );
++  if (hasSubtask) {
++    assert.notEqual(
++      frontmatter.subtask,
++      'true',
++      'superspec-apply.md frontmatter must not set subtask: true — that would nest its own ' +
++        'Task-tool dispatches at depth 2 instead of depth 1'
++    );
++  } else {
++    assert.ok(
++      true,
++      'subtask is absent from frontmatter, which defaults to depth 1'
++    );
++  }
++});

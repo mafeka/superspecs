@@ -1,6 +1,6 @@
 {
   "name": "superspecs",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "SuperSpec: a spec-driven development workflow wrapping the openspec CLI with TDD discipline and subagent-based implementation.",
   "type": "module",
   "scripts": {

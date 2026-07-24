@@ -1,0 +1,268 @@
+ bin/install.js               | 61 ++++++++++++++++++++++++-------
+ test/installer-host.test.mjs | 86 ++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 135 insertions(+), 12 deletions(-)
+
+diff --git a/bin/install.js b/bin/install.js
+index 73c9134..220c678 100755
+--- a/bin/install.js
++++ b/bin/install.js
+@@ -8,54 +8,80 @@
+ //   node bin/install.js [target-dir] [--force]
+ //   npx github:mafeka/superspecs [target-dir] [--force]
+ 
+ import { existsSync, mkdirSync, cpSync, readFileSync, writeFileSync } from 'node:fs';
+ import { dirname, join, resolve } from 'node:path';
+ import { fileURLToPath } from 'node:url';
+ import { execFileSync, spawnSync } from 'node:child_process';
+ 
+ const PACKAGE_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
+ 
+-const PAYLOAD_PATHS = [
++const SHARED_PAYLOAD_PATHS = [
+   'openspec/schemas/superspec',
+   'scripts/superspec-lint.mjs',
++];
++
++const CLAUDE_PAYLOAD_PATHS = [
+   '.claude/commands/superspec-explore.md',
+   '.claude/commands/superspec-propose.md',
+   '.claude/commands/superspec-tasks.md',
+   '.claude/commands/superspec-apply.md',
+   '.claude/commands/superspec-archive.md',
+   '.claude/superspec',
+ ];
+ 
++const OPENCODE_PAYLOAD_PATHS = [
++  '.opencode/command/superspec-explore.md',
++  '.opencode/command/superspec-propose.md',
++  '.opencode/command/superspec-tasks.md',
++  '.opencode/command/superspec-apply.md',
++  '.opencode/command/superspec-archive.md',
++  '.opencode/agent/superspec.md',
++  '.opencode/superspec',
++];
++
++const VALID_HOSTS = ['claude', 'opencode', 'all'];
++
+ function log(message) {
+   console.log(`[superspecs] ${message}`);
+ }
+ 
+ function fail(message) {
+   console.error(`[superspecs] ERROR: ${message}`);
+   process.exit(1);
+ }
+ 
+ function commandExists(cmd) {
+   const probe = process.platform === 'win32' ? 'where' : 'which';
+   return spawnSync(probe, [cmd], { stdio: 'ignore' }).status === 0;
+ }
+ 
+ function run(cmd, args, cwd) {
+   execFileSync(cmd, args, { stdio: 'inherit', cwd });
+ }
+ 
+ function parseArgs(argv) {
+   const force = argv.includes('--force');
+-  const positional = argv.filter((a) => !a.startsWith('--'));
++
++  const hostFlagIndex = argv.indexOf('--host');
++  const host = hostFlagIndex === -1 ? 'all' : argv[hostFlagIndex + 1];
++  if (!VALID_HOSTS.includes(host)) {
++    fail(`Invalid --host value: ${host}. Expected one of: ${VALID_HOSTS.join(', ')}`);
++  }
++
++  const positional = argv.filter((a, i) => {
++    if (a.startsWith('--')) return false;
++    if (i === hostFlagIndex + 1 && hostFlagIndex !== -1) return false; // the --host value itself
++    return true;
++  });
+   const target = positional[0] ? resolve(positional[0]) : process.cwd();
+-  return { target, force };
++  return { target, force, host };
+ }
+ 
+ function ensureGit(target) {
+   if (!commandExists('git')) {
+     fail('git is required (task review and the final review in /superspec-apply both work from git diffs).');
+   }
+   if (!existsSync(join(target, '.git'))) {
+     log('Target is not a git repository yet.');
+     log('/superspec-apply requires one — run `git init` there before using it. Continuing with the rest of setup.');
+   }
+@@ -78,31 +104,42 @@ function resolveOpenspecBin(target) {
+     if (existsSync(localBin)) return localBin;
+     fail('Installed @fission-ai/openspec but could not find its binary at node_modules/.bin/openspec afterward.');
+   }
+ 
+   fail(
+     'openspec CLI not found, and there is no package.json in the target to add it to.\n' +
+     '  Install it with `npm install -g @fission-ai/openspec` and re-run this installer.'
+   );
+ }
+ 
+-function ensureOpenspecRoot(openspecBin, target) {
++function toolsForHost(host) {
++  if (host === 'claude') return 'claude';
++  if (host === 'opencode') return 'opencode';
++  return 'claude,opencode';
++}
++
++function ensureOpenspecRoot(openspecBin, target, host) {
+   if (existsSync(join(target, 'openspec'))) {
+     log('openspec/ already exists — skipping `openspec init`.');
+     return;
+   }
+-  log('Running `openspec init --tools claude`...');
+-  run(openspecBin, ['init', '.', '--tools', 'claude'], target);
++  const tools = toolsForHost(host);
++  log(`Running \`openspec init --tools ${tools}\`...`);
++  run(openspecBin, ['init', '.', '--tools', tools], target);
+ }
+ 
+-function installPayload(target, force) {
+-  for (const rel of PAYLOAD_PATHS) {
++function installPayload(target, force, host) {
++  const paths = [...SHARED_PAYLOAD_PATHS];
++  if (host === 'claude' || host === 'all') paths.push(...CLAUDE_PAYLOAD_PATHS);
++  if (host === 'opencode' || host === 'all') paths.push(...OPENCODE_PAYLOAD_PATHS);
++
++  for (const rel of paths) {
+     const src = join(PACKAGE_ROOT, rel);
+     const dest = join(target, rel);
+ 
+     if (!existsSync(src)) {
+       fail(`Missing expected source path in this package: ${rel}`);
+     }
+     if (existsSync(dest) && !force) {
+       log(`Skipping ${rel} (already exists — pass --force to overwrite)`);
+       continue;
+     }
+@@ -132,31 +169,31 @@ function setDefaultSchema(target) {
+     log('openspec/config.yaml already defaults to `superspec`.');
+   }
+ }
+ 
+ function validateSchema(openspecBin, target) {
+   log('Validating the superspec schema...');
+   run(openspecBin, ['schema', 'validate', 'superspec'], target);
+ }
+ 
+ function main() {
+-  const { target, force } = parseArgs(process.argv.slice(2));
++  const { target, force, host } = parseArgs(process.argv.slice(2));
+ 
+   if (!existsSync(target)) {
+     fail(`Target directory does not exist: ${target}`);
+   }
+ 
+-  log(`Installing into ${target}${force ? ' (--force: overwriting existing files)' : ''}`);
++  log(`Installing into ${target}${force ? ' (--force: overwriting existing files)' : ''} [host: ${host}]`);
+ 
+   ensureGit(target);
+   const openspecBin = resolveOpenspecBin(target);
+-  ensureOpenspecRoot(openspecBin, target);
+-  installPayload(target, force);
++  ensureOpenspecRoot(openspecBin, target, host);
++  installPayload(target, force, host);
+   setDefaultSchema(target);
+   validateSchema(openspecBin, target);
+ 
+   log('Done.');
+   log('Restart your IDE (or reload the Claude Code window) to pick up the new slash commands.');
+   log('Then try: /superspec-explore, /superspec-propose, /superspec-tasks, /superspec-apply, /superspec-archive');
+ }
+ 
+ main();
+diff --git a/test/installer-host.test.mjs b/test/installer-host.test.mjs
+new file mode 100644
+index 0000000..15bd5ba
+--- /dev/null
++++ b/test/installer-host.test.mjs
+@@ -0,0 +1,86 @@
++import { test } from 'node:test';
++import assert from 'node:assert/strict';
++import fs from 'node:fs';
++import os from 'node:os';
++import path from 'node:path';
++import { fileURLToPath } from 'node:url';
++import { execFileSync } from 'node:child_process';
++
++const __dirname = path.dirname(fileURLToPath(import.meta.url));
++const repoRoot = path.resolve(__dirname, '..');
++const installerPath = path.join(repoRoot, 'bin', 'install.js');
++
++function makeTempRepo() {
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'superspecs-installer-'));
++  execFileSync('git', ['init'], { cwd: dir, stdio: 'ignore' });
++  return dir;
++}
++
++function runInstaller(targetDir, extraArgs = []) {
++  return execFileSync('node', [installerPath, targetDir, ...extraArgs], {
++    cwd: repoRoot,
++    encoding: 'utf8',
++  });
++}
++
++test('Default installs both hosts', () => {
++  const target = makeTempRepo();
++  try {
++    runInstaller(target);
++
++    // Claude Code payload set present.
++    assert.ok(
++      fs.existsSync(path.join(target, '.claude', 'commands', 'superspec-apply.md')),
++      '.claude/commands/superspec-apply.md should be installed by default'
++    );
++    assert.ok(
++      fs.existsSync(path.join(target, '.claude', 'superspec')),
++      '.claude/superspec should be installed by default'
++    );
++
++    // OpenCode payload set present.
++    assert.ok(
++      fs.existsSync(path.join(target, '.opencode', 'command', 'superspec-apply.md')),
++      '.opencode/command/superspec-apply.md should be installed by default'
++    );
++    assert.ok(
++      fs.existsSync(path.join(target, '.opencode', 'agent', 'superspec.md')),
++      '.opencode/agent/superspec.md should be installed by default'
++    );
++    assert.ok(
++      fs.existsSync(path.join(target, '.opencode', 'superspec')),
++      '.opencode/superspec should be installed by default'
++    );
++  } finally {
++    fs.rmSync(target, { recursive: true, force: true });
++  }
++});
++
++test('Host flag restricts to one payload set', () => {
++  const target = makeTempRepo();
++  try {
++    runInstaller(target, ['--host', 'opencode']);
++
++    // OpenCode payload set present.
++    assert.ok(
++      fs.existsSync(path.join(target, '.opencode', 'command', 'superspec-apply.md')),
++      '.opencode/command/superspec-apply.md should be installed with --host opencode'
++    );
++    assert.ok(
++      fs.existsSync(path.join(target, '.opencode', 'agent', 'superspec.md')),
++      '.opencode/agent/superspec.md should be installed with --host opencode'
++    );
++    assert.ok(
++      fs.existsSync(path.join(target, '.opencode', 'superspec')),
++      '.opencode/superspec should be installed with --host opencode'
++    );
++
++    // No .claude/ at all.
++    assert.ok(
++      !fs.existsSync(path.join(target, '.claude')),
++      '.claude/ should not be created when --host opencode is passed'
++    );
++  } finally {
++    fs.rmSync(target, { recursive: true, force: true });
++  }
++});
